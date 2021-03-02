@@ -190,6 +190,10 @@ MODULE_PARM_DESC(msg_level, "Message level bit mask");
 #define MP2T_AFC_SHIFT		4
 #define MP2T_CC_SHIFT		0
 
+// MASK,SHIFT,VALUE FOR int8
+#define RTP_VERS_SHIFT		6
+#define RTP_VERS_MASK		0xc0
+#define RTP_VERS		2
 /** WIRESHARK CODE COPY-PASTE
  *
  * Wireshark value_string structures
@@ -263,11 +267,54 @@ struct pid_data_t {
 	struct list_head list;
 	int16_t pid;
 	int16_t cc_prev;
+	uint64_t skips_pid;
+	uint64_t discontinuity_pid;
+	uint32_t stream_type;
+	uint64_t packets ____cacheline_aligned;
 };
 
 #define MAX_PID 0x1FFF
 
 /** Hash table stuff **/
+
+const char * identify_stream_type(char s) {
+	switch (s) {
+		case 0x00: return "Reserved";
+		case 0x01: return "11172-2 video (MPEG-1)";
+		case 0x02: return "H.262 video (MPEG-2) ";
+		case 0x03: return "11172-3 audio (MPEG-1)";
+		case 0x04: return "13818-3 audio (MPEG-2)";
+		case 0x05: return "H.222.0/13818-1 private sections";
+		case 0x06: return "H.222.0/13818-1 PES private (maybe Dolby/AC-3)";
+		case 0x07: return "13522 MHEG";
+		case 0x08: return "H.222.0/13818-1 Annex A - DSM CC";
+		case 0x09: return "H.222.1";
+		case 0x0A: return "13818-6 type A";
+		case 0x0B: return "13818-6 type B";
+		case 0x0C: return "13818-6 type C";
+		case 0x0D: return "13818-6 type D";
+		case 0x0E: return "H.222.0/13818-1 auxiliary";
+		case 0x0F: return "13818-7 Audio with ADTS transport syntax";
+		case 0x10: return "14496-2 Visual (MPEG-4 part 2 video)";
+		case 0x11: return "14496-3 Audio with LATM transport syntax (14496-3/AMD 1)";
+		case 0x12: return "14496-1 SL-packetized or FlexMux stream in PES packets";
+		case 0x13: return "14496-1 SL-packetized or FlexMux stream in 14496 sections";
+		case 0x14: return "ISO/IEC 13818-6 Synchronized Download Protocol";
+		case 0x15: return "Metadata in PES packets";
+		case 0x16: return "Metadata in metadata_sections";
+		case 0x17: return "Metadata in 13818-6 Data Carousel";
+		case 0x18: return "Metadata in 13818-6 Object Carousel";
+		case 0x19: return "Metadata in 13818-6 Synchronized Download Protocol";
+		case 0x1A: return "13818-11 MPEG-2 IPMP stream";
+		case 0x1B: return "H.264 video (MPEG-4/AVC)";
+		case 0x24: return "HEVC video stream";
+		case 0x25: return "HEVC temporal video subset (profile Annex A H.265)";
+		case 0x42: return "AVS Video";
+		case 0x7F: return "IPMP stream";
+		default:
+		return "unknown";
+	}
+}
 
 /* Data to match a stream / connection */
 struct mpeg2ts_stream_match { /* Like xt_hashlimit: dsthash_dst */
@@ -304,6 +351,8 @@ struct mpeg2ts_stream { /* Like xt_hashlimit: dsthash_ent */
 	/* TODO: Explain difference between skips and discontinuity */
 	uint64_t skips;
 	uint64_t discontinuity;
+	int8_t tsc;
+	uint16_t pmt_pid;
 
 	/* lock for writing/changing/updating */
 	spinlock_t lock;
@@ -575,8 +624,11 @@ mpeg2ts_pid_create(struct mpeg2ts_stream *stream, const int16_t pid)
 	}
 	entry->pid     = pid;
 	entry->cc_prev = -1;
-
+	entry->skips_pid = 0;
+	entry->discontinuity_pid = 0;
+	entry->stream_type = 0;
 	stream->pid_list_len++;
+	entry->packets = 0;
 
 	list_add_tail(&entry->list, &stream->pid_list);
 
@@ -657,7 +709,6 @@ mpeg2ts_stream_alloc_init(struct xt_rule_mpeg2ts_conn_htable *ht,
 	/* Init the pid table list */
 	INIT_LIST_HEAD(&entry->pid_list);
 	entry->pid_list_len = 0;
-
 	/* init the RCU callback structure needed by call_rcu() */
 	/* The INIT_RCU_HEAD macro/function got removed in 2.6.36,
 	 *  from what I can see in the git kernel changelogs it should
@@ -917,7 +968,7 @@ detect_cc_drops(struct pid_data_t *pid_data, int8_t cc_curr,
 
 	cc_prev           = pid_data->cc_prev;
 	pid_data->cc_prev = cc_curr;
-
+	pid_data->packets++;
 	/* Null packet always have a CC value equal 0 */
 	if (pid_data->pid == 0x1fff)
 		return 0;
@@ -937,10 +988,12 @@ detect_cc_drops(struct pid_data_t *pid_data, int8_t cc_curr,
 	if (cc_curr != ((cc_prev+1) & MP2T_CC_MASK)) {
 		skips = calc_skips(cc_curr, cc_prev);
 
-		msg_info(RX_STATUS,
+/*		msg_info(RX_STATUS,
 			 "Detected drop pid:%d CC curr:%d prev:%d skips:%d",
 			 pid_data->pid, cc_curr, cc_prev, skips);
-
+*/
+		pid_data->skips_pid += skips;
+		pid_data->discontinuity_pid++;
 		/* TODO: Do accounting per PID ?
 		pid_data->cc_skips += skips;
 		pid_data->cc_err++;
@@ -961,17 +1014,107 @@ dissect_tsp(const unsigned char *payload_ptr, uint16_t payload_len,
 	int8_t cc_curr;
 	int skips = 0;
 	struct pid_data_t *pid_data;
+	uint8_t * psi_table_ptr;
+	int8_t pusi;
+	uint8_t psi_pointer;
+	uint8_t * pat_table_ptr;
+	uint16_t section_length;
+	int parse;
+	uint16_t prog_num;
+	uint8_t prog_num_res;
+	uint16_t pmt;
+	uint8_t table_id;
+	uint16_t table_length;
+	uint32_t section_es_length;
+	uint8_t reserved;
+	uint8_t cur_section;
+	uint8_t last_section;
+	uint8_t pmt_reserved;
+	uint16_t pmt_prog_info_len;
+	int pmt_section_step = 0;
+	uint32_t stream_type = 0;
+	int program_count;
+	uint32_t stream_pid;
+	uint32_t reserved_three_bit;
+	uint32_t reserved_four_bit;
+	uint32_t reserved_two_bits;
+
 
 	/*
 	 * Process header. TSP headers come every MP2T_PACKET_SIZE bytes,
 	 * which is a multiple of 32 bits, so not using get_unaligned
 	 * is ok here.
 	 */
+
 	header  = ntohl(*(uint32_t *)payload_ptr);
 	pid     = (header & MP2T_PID_MASK) >> MP2T_PID_SHIFT;
-	afc     = (header & MP2T_AFC_MASK) >> MP2T_AFC_SHIFT;
+	afc     = (header & MP2T_AFC_MASK) >> MP2T_AFC_SHIFT;  //adaptation field control
 	cc_curr = (header & MP2T_CC_MASK)  >> MP2T_CC_SHIFT;
+	pusi    = (header & MP2T_PUSI_MASK ) >> MP2T_PUSI_SHIFT;
+	stream->tsc = (header & MP2T_TSC_MASK)  >> MP2T_TSC_SHIFT;  //Transport Scrambling Control
 
+
+	psi_table_ptr = (uint8_t * ) (payload_ptr+4);
+	if( pusi && pid == 0) {
+		stream->pmt_pid = 0;
+		psi_pointer = (uint8_t ) (( (uint32_t ) ntohl(*((uint32_t*) (psi_table_ptr))) & 0xff000000 ) >> (32-8));
+		psi_table_ptr = psi_table_ptr + psi_pointer;
+		table_id = (uint8_t ) (( (uint32_t ) ntohl(*((uint32_t*) (psi_table_ptr+1))) & 0xff000000 ) >> (32-8));
+		section_length = (uint16_t ) (( (uint32_t ) ntohl(*((uint32_t*) (psi_table_ptr+1))) & 0x0003ff00 ) >> 8);
+		pat_table_ptr = psi_table_ptr+1+8;
+		for( parse=0 ; parse <= section_length-1-8; parse++ ) {
+			pat_table_ptr = pat_table_ptr + parse*4;
+			prog_num = (uint16_t ) (( (uint32_t ) ntohl(*((uint32_t*) (pat_table_ptr))) & 0xffff0000 ) >> (32-16));
+			prog_num_res = (uint8_t ) (( (uint32_t ) ntohl(*((uint32_t*) (pat_table_ptr))) & 0x0000e000 ) >> (32-16-3));
+			pmt = (uint16_t ) ((uint32_t ) ntohl(*((uint32_t*) (pat_table_ptr))) & 0x00001fff );
+
+			if(prog_num && !table_id && prog_num_res == 7 && !stream->pmt_pid ) {
+				// TODO PMT SHOULD BE LIST COULD BE MULTIPLEXED
+				stream->pmt_pid = pmt;
+			}
+		}
+	} else if ( pusi && pid == stream->pmt_pid ) {
+		psi_pointer = (uint8_t ) (( (uint32_t ) ntohl(*((uint32_t*) (psi_table_ptr))) & 0xff000000 ) >> (32-8));
+		psi_table_ptr = psi_table_ptr + psi_pointer;
+		table_id = (uint8_t ) (( (uint32_t ) ntohl(*((uint32_t*) (psi_table_ptr+1))) & 0xff000000 ) >> (32-8));
+		if( table_id != 2 ) { //not PMT table
+			printk(KERN_INFO "goto PMT_OUT table_id %d\n",table_id);
+			goto PMT_OUT;
+		}
+		table_length = (uint16_t ) (( (uint32_t ) ntohl(*((uint32_t*) (psi_table_ptr+1))) & 0x0003ff00 ) >> 8);
+		section_es_length = 0;
+		if(psi_pointer) {
+			printk(KERN_CRIT "FOK NOT NULL PSI POINTER %d\n", psi_pointer);
+		}
+		reserved = (uint8_t ) ((ntohl(*((uint32_t*) (psi_table_ptr+6))) & 0xc0000000 ) >> 30);
+		cur_section = (uint8_t ) ((ntohl(*((uint32_t*) (psi_table_ptr+6+1))) & 0xff000000 ) >> (32-8));
+		last_section = (uint8_t ) ((ntohl(*((uint32_t*) (psi_table_ptr+6+1))) & 0x00ff0000 ) >> (32-16));
+		pmt_reserved = (uint8_t ) ((ntohl(*((uint32_t*) (psi_table_ptr+6+1+1+1))) & 0xe0000000 ) >> (32-3));
+		pmt_prog_info_len = (uint16_t ) ((ntohl(*((uint32_t*) (psi_table_ptr+6+1+1+1))) & 0x000003ff ));
+		psi_table_ptr = psi_table_ptr + pmt_prog_info_len;
+		pmt_section_step = 0;
+		stream_type = 0;
+
+		for (program_count = 0; pmt_section_step < table_length ; program_count++ ) {
+			//+4 PMT TABLE SPECIFIC skip PCR PID atd
+			uint32_t pmt_section_data = (uint32_t ) ntohl(*((uint32_t*) (psi_table_ptr+4+5+4 + pmt_section_step )));
+			stream_type = (uint32_t) ( pmt_section_data  & 0xff000000 ) >> 24 ;
+			stream_pid =  ( pmt_section_data  & 0x001fff00 ) >> 8 ;
+			reserved_three_bit = ( pmt_section_data & 0x00f00000 ) >> 21;
+			reserved_four_bit =  ( pmt_section_data  & 0x000000f0 ) >> 4;
+			reserved_two_bits =  ( pmt_section_data & 0x00000003 ) >> 2;
+			section_es_length =  ( (uint32_t ) ntohl(*((uint32_t*) (psi_table_ptr+4+5+4+3 + pmt_section_step )))  & 0x03ff0000 ) >> 16 ;
+			if( reserved_four_bit == 15 && reserved_two_bits == 0 && reserved_three_bit == 7 ) {
+				pid_data = mpeg2ts_pid_find(stream, stream_pid);
+				if(pid_data) {
+					pid_data->stream_type = stream_type;
+				}
+			}
+			pmt_section_step = pmt_section_step+5+section_es_length;
+		}
+	}
+
+    PMT_OUT:
 	msg_dbg(PKTDATA, "TS header:0x%X pid:%d cc:%d afc:%u",
 		header, pid, cc_curr, afc);
 
@@ -1037,7 +1180,7 @@ dissect_mpeg2ts(const unsigned char *payload_ptr, uint16_t payload_len,
 		}
 		/* msg_info(RX_STATUS, */
 		printk(KERN_INFO
-		       "Rule:%u New stream (%pI4 -> %pI4)\n",
+		       "Rule:%u New streambla (%pI4 -> %pI4)\n",
 		       hinfo->id, &iph->saddr, &iph->daddr);
 	}
 
@@ -1070,6 +1213,8 @@ dissect_mpeg2ts(const unsigned char *payload_ptr, uint16_t payload_len,
 	// TODO: Add flag to avoid/disable this update, for perf testing
 	stream->payload_bytes += payload_len;
 	stream->packets++;
+	//get header -> get value
+
 
 	if (discontinuity > 0) {
 		stream->skips         += skips_total;
@@ -1081,7 +1226,7 @@ dissect_mpeg2ts(const unsigned char *payload_ptr, uint16_t payload_len,
 	rcu_read_unlock_bh();
 	/* spin_unlock_bh(&hinfo->lock); // Replaced by RCU */
 
-	/* Place print statement after the unlock section */
+	/* Place print statement after the unlock section
 	if (discontinuity > 0) {
 		msg_notice(RX_STATUS,
 			   "Detected discontinuity "
@@ -1089,7 +1234,7 @@ dissect_mpeg2ts(const unsigned char *payload_ptr, uint16_t payload_len,
 			   &ip_hdr(skb)->saddr, &ip_hdr(skb)->daddr,
 			   discontinuity, skips_total);
 	}
-
+	*/
 	return skips_total;
 }
 
@@ -1190,6 +1335,16 @@ xt_mpeg2ts_match(const struct sk_buff *skb, struct xt_action_param *par)
 	hdr_size    = par->thoff + sizeof(struct udphdr);
 	payload_ptr = skb_network_header(skb) + hdr_size;
 	/* payload_ptr = skb->data + hdr_size; */
+	if( payload_ptr &&  payload_ptr[0] != MP2T_SYNC_BYTE  &&
+		( ( ( payload_ptr[0] & RTP_VERS_MASK ) >> RTP_VERS_SHIFT ) == RTP_VERS ) ) {
+		if ( (payload_ptr[0] & 0x40) >> 5 != 0 ) {
+			printk(KERN_INFO "RTP with non zero padding ");
+		}
+
+		hdr_size    = par->thoff + sizeof(struct udphdr) + 12;
+		payload_ptr = skb_network_header(skb) + hdr_size;
+	}
+
 	BUG_ON(payload_ptr != (skb->data + hdr_size));
 
 	/* Different ways to determine the payload_len.  Think the
@@ -1300,15 +1455,15 @@ static int mpeg2ts_seq_show_real(struct mpeg2ts_stream *stream,
 				 struct seq_file *s, unsigned int bucket)
 {
 	int res;
+	struct pid_data_t *entry;
 
 	if (!atomic_inc_not_zero(&stream->use)) {
 		/* If "use" is zero, then we about to be free'd */
 		return 0;
 	}
-
 	res = seq_printf(s, "bucket:%d dst:%pI4 src:%pI4 dport:%u sport:%u "
-			    "pids:%d skips:%llu discontinuity:%llu "
-			    "payload_bytes:%llu packets:%llu\n",
+			    "pids:%d skips_sum:%llu discontinuity_sum:%llu "
+			    "payload_bytes:%llu packets:%llu scrambled:%d pmt_pid:%d\n",
 			 bucket,
 			 &stream->match.dst_addr,
 			 &stream->match.src_addr,
@@ -1318,8 +1473,30 @@ static int mpeg2ts_seq_show_real(struct mpeg2ts_stream *stream,
 			 stream->skips,
 			 stream->discontinuity,
 			 stream->payload_bytes,
-			 stream->packets
+			 stream->packets,
+			 stream->tsc,
+			 stream->pmt_pid
 		);
+
+	list_for_each_entry(entry, &stream->pid_list, list) {
+		if ( entry->pid != 0x1fff && entry->pid > 17 && entry->pid != stream->pmt_pid  ) { //not null packet
+                    seq_printf(s,"\t+bucket:%d dst:%pI4 src:%pI4 dport:%u sport:%u pid:%u pid_hex:0x%x stream_type_hex:0x%x "
+			     "skips_pid:%llu discontinuity_pid:%llu packets:%llu stream_type:%s\n" ,
+			 bucket,
+			 &stream->match.dst_addr,
+			 &stream->match.src_addr,
+			 ntohs(stream->match.dst_port),
+			 ntohs(stream->match.src_port),
+			 entry->pid,
+			 entry->pid,
+			 entry->stream_type & 0xff,
+			 entry->skips_pid,
+			 entry->discontinuity_pid,
+			 entry->packets,
+			 identify_stream_type(entry->stream_type)
+			);
+		}
+        }
 
 	atomic_dec(&stream->use);
 
